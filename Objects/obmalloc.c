@@ -184,10 +184,9 @@ _PyMem_Initialize()
     }
     fclose(fptr);
 
-    printf("ENABLED: %d\n\n", enabled);
-
     if (enabled != 0)
     {
+        // printf("ENABLED: %d\n\n", enabled);
         _PyMem_IsInitialized = true;
         return;
     }
