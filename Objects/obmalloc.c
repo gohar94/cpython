@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>               // malloc()
+#include <unistd.h>
 
 
 /* Defined in tracemalloc.c */
