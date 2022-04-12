@@ -236,6 +236,7 @@ _PyMem_CustomMalloc(void *ctx, size_t size)
 
     // _PyMem_OffsetTemp += (numpages * PageSize);
     // printf("MMAP: %d, %ld, %d, %d, \n\n", _PyMem_fd, size, numpages, _PyMem_OffsetTemp);
+    close(fd);
     return ret;
 }
 
