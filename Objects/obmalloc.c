@@ -2,8 +2,10 @@
 #include "pycore_pymem.h"         // _PyTraceMalloc_Config
 #include "pycore_code.h"         // stats
 
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>               // malloc()
+#include <unistd.h>
 
 
 /* Defined in tracemalloc.c */
@@ -129,6 +131,173 @@ _PyMem_RawFree(void *ctx, void *ptr)
     free(ptr);
 }
 
+// static char _PyMem_Mmap_Path[128] = "foobar"; // TODO change to /dev/shm/_cpython; getting permission issues?
+static size_t _PyMem_Mmap_Size = 8589934592; // 8GB
+static bool _PyMem_IsInitialized = false;
+static bool _PyMem_IsChecked = false;
+// static int _PyMem_fd = -1;
+// static int _PyMem_OffsetTemp = 0;
+static size_t PageSize = 0;
+
+static int
+_PyMem_GetFd(const char *path, const size_t mmap_size)
+{
+    // get shared memory file descriptor (NOT a file)
+    int fd = shm_open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (fd == -1)
+    {
+        perror("open");
+        exit(10);
+    }
+
+    // extend shared memory object as by default it's initialized with size 0
+    if (ftruncate(fd, mmap_size) != 0)
+    {
+        perror("ftruncate");
+        exit(20);
+    }
+
+    return fd;
+}
+
+static void
+_PyMem_Initialize()
+{
+    _PyMem_IsChecked = true;
+
+    PageSize = sysconf(_SC_PAGE_SIZE);
+    srand((unsigned) time(0));
+    // int rand_num_int = rand();
+    // char rand_num_str[64];
+    // sprintf(rand_num_str, "%d", rand_num_int);
+    // strcat(_PyMem_Mmap_Path, rand_num_str);
+    // printf("FILENAME: %s\n\n", _PyMem_Mmap_Path);
+
+    FILE *fptr = fopen("foobarconfig", "r");
+    if (fptr == NULL)
+    {
+        printf("BADFILE GOHAR\n\n");
+    }
+    int enabled;
+    if (fscanf(fptr, "%d", &enabled) == EOF)
+    {
+        printf("BAD READ GOHAR \n");
+    }
+    fclose(fptr);
+
+    if (enabled != 0)
+    {
+        // printf("ENABLED: %d\n\n", enabled);
+        _PyMem_IsInitialized = true;
+        return;
+    }
+
+    // get shared memory file descriptor (NOT a file)
+    // _PyMem_fd = _PyMem_GetFd(_PyMem_Mmap_Path, _PyMem_Mmap_Size);
+    // _PyMem_IsInitialized = true;
+}
+
+static void *
+_PyMem_CustomMalloc(void *ctx, size_t size)
+{
+    if (size > _PyMem_Mmap_Size)
+    {
+        perror("malloc");
+        return NULL;
+    }
+
+    /* PyMem_RawMalloc(0) means malloc(1). Some systems would return NULL
+       for malloc(0), which would be treated as an error. Some platforms would
+       return a pointer with no memory behind it, which would break pymalloc.
+       To solve these problems, allocate an extra byte. */
+    if (size == 0)
+        size = 1;
+
+    // We will store the size of allocated memory in the header
+    size += sizeof(size_t);
+
+    int rand_num_int = rand();
+    char rand_num_str[64];
+    sprintf(rand_num_str, "%d", rand_num_int);
+    int fd = _PyMem_GetFd(rand_num_str, size);
+    void *header = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0);
+    size_t *sizeptr = (size_t*)header;
+    *sizeptr = size;
+    size_t *retsizeptr = sizeptr + 1;
+    void *ret = (void*)retsizeptr;
+    // printf("malloc: %d, %ld\n", fd, size);
+    printf("malloc %p, %p, %s, %ld\n", ret, header, rand_num_str, size);
+
+    // void* ret = mmap(NULL, size, PROT_WRITE, MAP_SHARED, _PyMem_fd, _PyMem_OffsetTemp);
+    // if (ret == MAP_FAILED)
+    // {
+    //     perror("mmap");
+    //     return NULL;
+    // }
+
+    // _PyMem_OffsetTemp += (numpages * PageSize);
+    // printf("MMAP: %d, %ld, %d, %d, \n\n", _PyMem_fd, size, numpages, _PyMem_OffsetTemp);
+    close(fd);
+    return ret;
+}
+
+static void *
+_PyMem_CustomCalloc(void *ctx, size_t nelem, size_t elsize)
+{
+    /* PyMem_RawCalloc(0, 0) means calloc(1, 1). Some systems would return NULL
+       for calloc(0, 0), which would be treated as an error. Some platforms
+       would return a pointer with no memory behind it, which would break
+       pymalloc.  To solve these problems, allocate an extra byte. */
+    if (nelem == 0 || elsize == 0) {
+        nelem = 1;
+        elsize = 1;
+    }
+    return _PyMem_CustomMalloc(ctx, nelem * elsize);
+}
+
+static void
+_PyMem_CustomFree(void *ctx, void *ptr)
+{
+    if (ptr == NULL)
+    {
+        return;
+    }
+    size_t *sizeptr = (size_t*)ptr;
+    size_t *header = sizeptr - 1;
+    size_t len = *header;
+    // printf("free %ld, %p, %p\n\n", len, ptr, header);
+    void *headerptr = (void*)header;
+    if (munmap(headerptr, len) != 0)
+    {
+        perror("munmap");
+    }
+    return;
+}
+
+static void *
+_PyMem_CustomRealloc(void *ctx, void *ptr, size_t size)
+{
+    if (size == 0)
+        size = 1;
+
+    void* newmem = _PyMem_CustomMalloc(ctx, size);
+    if (newmem == NULL)
+    {
+        perror("malloc");
+        return NULL;
+    }
+
+    if (ptr != NULL)
+    {
+        size_t *sizeptr = (size_t*)ptr;
+        size_t *header = sizeptr - 1;
+        size_t len = *header;
+        memcpy(newmem, ptr, len);
+        _PyMem_CustomFree(ctx, ptr);
+    }
+
+    return newmem;
+}
 
 #ifdef MS_WINDOWS
 static void *
@@ -583,6 +752,19 @@ PyMem_RawMalloc(size_t size)
      */
     if (size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomMalloc(_PyObject.ctx, size);
+    }
+
     return _PyMem_Raw.malloc(_PyMem_Raw.ctx, size);
 }
 
@@ -592,6 +774,19 @@ PyMem_RawCalloc(size_t nelem, size_t elsize)
     /* see PyMem_RawMalloc() */
     if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomCalloc(_PyObject.ctx, nelem, elsize);
+    }
+
     return _PyMem_Raw.calloc(_PyMem_Raw.ctx, nelem, elsize);
 }
 
@@ -601,11 +796,31 @@ PyMem_RawRealloc(void *ptr, size_t new_size)
     /* see PyMem_RawMalloc() */
     if (new_size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomRealloc(_PyObject.ctx, ptr, new_size);
+    }
+
     return _PyMem_Raw.realloc(_PyMem_Raw.ctx, ptr, new_size);
 }
 
 void PyMem_RawFree(void *ptr)
 {
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        _PyMem_CustomFree(_PyObject.ctx, ptr);
+        return;
+    }
+
     _PyMem_Raw.free(_PyMem_Raw.ctx, ptr);
 }
 
@@ -616,6 +831,19 @@ PyMem_Malloc(size_t size)
     /* see PyMem_RawMalloc() */
     if (size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomMalloc(_PyObject.ctx, size);
+    }
+
     return _PyMem.malloc(_PyMem.ctx, size);
 }
 
@@ -625,6 +853,19 @@ PyMem_Calloc(size_t nelem, size_t elsize)
     /* see PyMem_RawMalloc() */
     if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomCalloc(_PyObject.ctx, nelem, elsize);
+    }
+
     return _PyMem.calloc(_PyMem.ctx, nelem, elsize);
 }
 
@@ -634,12 +875,32 @@ PyMem_Realloc(void *ptr, size_t new_size)
     /* see PyMem_RawMalloc() */
     if (new_size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomRealloc(_PyObject.ctx, ptr, new_size);
+    }
+
     return _PyMem.realloc(_PyMem.ctx, ptr, new_size);
 }
 
 void
 PyMem_Free(void *ptr)
 {
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        _PyMem_CustomFree(_PyObject.ctx, ptr);
+        return;
+    }
+
     _PyMem.free(_PyMem.ctx, ptr);
 }
 
@@ -697,6 +958,19 @@ PyObject_Malloc(size_t size)
     if (size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
     OBJECT_STAT_INC(allocations);
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomMalloc(_PyObject.ctx, size);
+    }
+
     return _PyObject.malloc(_PyObject.ctx, size);
 }
 
@@ -707,6 +981,19 @@ PyObject_Calloc(size_t nelem, size_t elsize)
     if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
         return NULL;
     OBJECT_STAT_INC(allocations);
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomCalloc(_PyObject.ctx, nelem, elsize);
+    }
+
     return _PyObject.calloc(_PyObject.ctx, nelem, elsize);
 }
 
@@ -716,6 +1003,19 @@ PyObject_Realloc(void *ptr, size_t new_size)
     /* see PyMem_RawMalloc() */
     if (new_size > (size_t)PY_SSIZE_T_MAX)
         return NULL;
+
+    if (!_PyMem_IsChecked &&
+        !_PyMem_IsInitialized)
+    {
+        _PyMem_Initialize();
+    }
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        return _PyMem_CustomRealloc(_PyObject.ctx, ptr, new_size);
+    }
+
     return _PyObject.realloc(_PyObject.ctx, ptr, new_size);
 }
 
@@ -723,6 +1023,14 @@ void
 PyObject_Free(void *ptr)
 {
     OBJECT_STAT_INC(frees);
+
+    if (_PyMem_IsChecked &&
+        _PyMem_IsInitialized)
+    {
+        _PyMem_CustomFree(_PyObject.ctx, ptr);
+        return;
+    }
+
     _PyObject.free(_PyObject.ctx, ptr);
 }
 
@@ -1996,6 +2304,11 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
 static void *
 _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
 {
+    if (_PyMem_IsInitialized)
+    {
+        return _PyMem_CustomCalloc(ctx, nelem, elsize);
+    }
+
     assert(elsize == 0 || nelem <= (size_t)PY_SSIZE_T_MAX / elsize);
     size_t nbytes = nelem * elsize;
 
